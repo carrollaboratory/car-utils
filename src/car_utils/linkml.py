@@ -1,0 +1,248 @@
+import hashlib
+import importlib
+import importlib.util
+import logging
+import sys
+from pathlib import Path
+
+import requests
+from sqlalchemy import create_engine, select
+from sqlalchemy.inspection import inspect
+from sqlalchemy.orm import sessionmaker
+
+
+def get_local_git_sha(file_path: Path):
+    """Calculates the Git-style SHA1 hash of a local file."""
+    if not file_path.exists():
+        return None
+
+    with open(file_path, "rb") as f:
+        data = f.read()
+    # GitHub's blob SHA is sha1("blob " + length + "\0" + content)
+    header = f"blob {len(data)}\0".encode("utf-8")
+    return hashlib.sha1(header + data).hexdigest()
+
+
+def sync_github_file(
+    owner: str,
+    repo: str,
+    path: str,
+    ref: str = "main",
+    local_filepath: Path | None = None,
+):
+    """
+    Downloads a file from GitHub only if it's missing or out of date.
+    'ref' can be a branch name, tag, or specific commit SHA.
+    """
+    save_as = local_filepath if local_filepath else Path(path).stem
+    api_url = f"https://api.github.com/repos/{owner}/{repo}/contents/{path}?ref={ref}"
+
+    # 1. Fetch metadata from GitHub API
+    response = requests.get(api_url)
+    if response.status_code != 200:
+        logging.error(f"Error fetching metadata: {response.json().get('message')}")
+        return
+
+    file_metadata = response.json()
+    remote_sha = file_metadata["sha"]
+    download_url = file_metadata["download_url"]
+
+    # 2. Compare local SHA with remote SHA
+    local_sha = get_local_git_sha(Path(save_as))
+
+    if local_sha == remote_sha:
+        logging.info(f"File '{save_as}' is already up to date (SHA: {remote_sha[:7]}).")
+        return
+
+    # 3. Download if different or missing
+    logging.warning(f"Update required. Downloading '{path}' from {ref}...")
+    file_data = requests.get(download_url)
+    with open(save_as, "wb") as f:
+        f.write(file_data.content)
+    logging.warning("Download complete.")
+    return save_as
+
+
+def get_model_pk(classname):
+    """Return the primary key associated with the specified class"""
+    mapper = inspect(classname)
+    return [column.key for column in mapper.primary_key]
+
+
+class LinkMLModelLoader:
+    """Helper class for loading and using LinkML-generated SQLAlchemy models with DBT tables.
+
+    With `model_as_file`, each instance loads its own fresh module object, so
+    multiple loaders (different prefixes/schemas) can coexist safely in one
+    process. With `model_import_path`, `importlib.import_module` returns the
+    same cached module on every call -- since table patching mutates that
+    module's metadata in place, a second loader using the same import path
+    will re-patch already-patched tables (prefixes compound, e.g.
+    'b_a_widget') rather than starting fresh. Use one `model_import_path`
+    loader per process, or use `model_as_file` if you need more than one.
+
+    `model_as_file` loads also register under `sys.modules[Path(file).stem]`,
+    so a `model_as_file` load and a `model_import_path` load can still
+    collide if the file's stem happens to match the import path.
+    """
+
+    DEFAULT_STAGING_DIR = "staging"
+
+    def __init__(
+        self,
+        database_url=None,
+        model_import_path=None,
+        model_as_file=None,
+        table_prefix="tgt_",
+        schema_name=None,
+        staging_dir=None,
+    ):
+        """
+        Initialize the loader.
+
+        Args:
+            database_url: SQLAlchemy database URL
+            model_import_path: dotted import path to a module with SQLAlchemy models
+            model_as_file: dict describing a model file, either already on disk
+                (model_filename) or fetched from GitHub (model_source,
+                model_filename, source_ref). Mutually exclusive with
+                model_import_path.
+            table_prefix: DBT table prefix (default: 'tgt_')
+            schema_name: Database schema (default: None)
+            staging_dir: where GitHub-sourced model files are cached
+                (default: DEFAULT_STAGING_DIR, relative to cwd)
+        """
+        self.github_repository = None
+        self.model_file_path = None
+        self.staging_dir = Path(staging_dir or self.DEFAULT_STAGING_DIR)
+
+        logging.debug(f"Model as File: {model_as_file}")
+        if model_as_file:
+            if model_import_path is not None:
+                raise ValueError(
+                    "When defining the data model, either the 'as_file' settings are used, or the 'import_path'"
+                )
+            if not self.staging_dir.exists():
+                logging.info(
+                    f"Creating model directory, '{self.staging_dir.absolute()}'"
+                )
+                self.staging_dir.mkdir(exist_ok=True, parents=True)
+
+            model_source = model_as_file.get("model_source")
+            model_filename = model_as_file.get("model_filename")
+            if model_source is None:
+                self.model_file_path = model_filename
+                assert Path(model_filename).exists(), (
+                    f"File not found: '{model_filename}' does not exist."
+                )
+            else:
+                self.github_repository = model_source
+                self.model_file_path = self.staging_dir / model_filename
+
+                gh_owner, gh_repo = model_source.split("/")
+                sync_github_file(
+                    gh_owner,
+                    gh_repo,
+                    f"project/sqlalchemy/{model_filename}",
+                    ref=model_as_file.get("source_ref"),
+                    local_filepath=self.model_file_path,
+                )
+        self.import_path = model_import_path
+        self.database_url = database_url
+        self.table_prefix = table_prefix
+        self.schema_name = schema_name
+        self.module = None
+        self.engine = None
+        self.Session = None
+
+    @property
+    def _conn_dialect(self):
+        module_name = type(self.dbconn).__module__
+
+        if "duckdb" in module_name:
+            return "duckdb"
+
+        if "sqlite" in module_name:
+            return "sqlite"
+
+        if "psycopg" in module_name:
+            return "postgresql"
+
+        raise TypeError(f"Unsupported database connection type: {module_name}")
+
+    def load(self):
+        """Load the models and set up database connection."""
+
+        self.engine = create_engine(self.database_url)
+
+        # Patch and load module
+        self.module = self._load_and_patch_module()
+
+        # Create session factory
+        self.Session = sessionmaker(bind=self.engine)
+
+        return self
+
+    def _load_and_patch_module(self):
+        """Load the module and patch table names."""
+        # Load module from file
+        if self.model_file_path:
+            module_name = Path(self.model_file_path).stem
+            spec = importlib.util.spec_from_file_location(
+                module_name, self.model_file_path
+            )
+            module = importlib.util.module_from_spec(spec)
+            # Add to sys.modules and execute
+            sys.modules[module_name] = module
+            spec.loader.exec_module(module)
+        else:
+            module_name = self.import_path
+            module = importlib.import_module(self.import_path)
+
+        # Patch the module's tables
+        if hasattr(module, "Base") and hasattr(module.Base, "metadata"):
+            logging.info(f"Patching module: '{module_name}'")
+
+            if self.schema_name:
+                module.Base.metadata.schema = self.schema_name
+
+            patched_count = 0
+            for table in list(module.Base.metadata.tables.values()):
+                original_name = table.name
+                new_name = self.table_prefix.format(original_name.lower())
+                logging.debug(f"  Patching table: '{original_name}' -> '{new_name}'")
+                table.name = new_name
+                patched_count += 1
+                if self.schema_name:
+                    table.schema = self.schema_name
+            logging.info(f"{patched_count} tables patched")
+        else:
+            logging.warning(f"Module '{module_name}' does not have Base.metadata")
+
+        return module
+
+    def get_model(self, class_name):
+        """Get a specific model class by name."""
+        if not self.module:
+            raise RuntimeError("Models not loaded. Call load() first.")
+        return getattr(self.module, class_name)
+
+    def create_session(self):
+        """Create a new database session."""
+        if not self.Session:
+            raise RuntimeError("Models not loaded. Call load() first.")
+        return self.Session()
+
+    def stream(self, class_name, chunksize=1000):
+        model = self.get_model(class_name)
+
+        with self.create_session() as session:
+            try:
+                stmt = select(model).execution_options(stream_results=True)
+                result = session.execute(stmt).yield_per(chunksize)
+
+                for partition in result.partitions():
+                    for row in partition:
+                        yield row[0]
+            except Exception as e:
+                logging.error(f"Error streaming {class_name}: {e}.")

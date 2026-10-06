@@ -21,10 +21,15 @@ def save_fowl2owl(url: str, output_filepath: Path):
     onto.save_to_file(str(output_filepath))
 
 
-def open_fowl2owl(url: str) -> Graph:
+def open_fowl2owl(url: str, ssl_no_verify=False) -> Graph:
     ssl._create_default_https_context = ssl._create_unverified_context
-
-    with urllib.request.urlopen(url) as response:
+    if ssl_no_verify:
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+    else:
+        ctx = None
+    with urllib.request.urlopen(url, context=ctx) as response:
         data = response.read().decode("utf-8")
 
     onto = pyhornedowl.open_ontology_from_string(data)
@@ -45,8 +50,14 @@ def save_owl(url: str, output_filepath: Path):
     onto.save_to_file(str(output_filepath))
 
 
-def open_owl(url: str):
-    with urllib.request.urlopen(url) as response:
+def open_owl(url: str, ssl_no_verify=False):
+    if ssl_no_verify:
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+    else:
+        ctx = None
+    with urllib.request.urlopen(url, context=ctx) as response:
         data = response.read()
 
     g = Graph()

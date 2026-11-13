@@ -1,5 +1,6 @@
 from importlib.metadata import PackageNotFoundError, version
 
+from .file_grabber import open_archive_buffer
 from .linkml import LinkMLModelLoader, get_model_pk, sync_github_file
 from .log_utils import is_interactive, setup_logging
 
@@ -13,6 +14,7 @@ __all__ = [
     "LinkMLModelLoader",
     "get_model_pk",
     "is_interactive",
+    "open_archive_buffer",
     "setup_logging",
     "sync_github_file",
 ]

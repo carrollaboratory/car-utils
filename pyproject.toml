@@ -25,6 +25,7 @@ dependencies = [
   "sqlalchemy",
   "requests",
   "py-horned-owl>=2.0.0",
+  "httpx>=0.28.1",
 ]
 
 [project.optional-dependencies]
